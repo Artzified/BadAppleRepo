@@ -37,4 +37,4 @@
 
 ## Limitations
 
-Due to the lack of speed in python, it cannot process large scale videos as it would pr. However, you can optimize the python script further to handle large scale videos
+Due to the lack of speed in python, it cannot process large scale videos as it would produce a `Script timeout` or a `HttpError: Timedout` error. However, you can optimize the python script further to handle large scale videos
