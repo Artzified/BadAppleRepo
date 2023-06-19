@@ -1,19 +1,20 @@
 import cv2
-import imutils.video
-
-import threading
-import queue
-
 import numpy as np
 import json
 
 import multiprocessing as mp
 
+import warnings
+
+from sklearn.cluster import MiniBatchKMeans
 from flask import Flask, Response, request
 
 BATCH_SIZE = 20 # How many frames are processed at once
+COLOR_ACCURACY = 50 # How many colors are allowed for 1 pixel
 
 app = Flask(__name__)
+
+warnings.filterwarnings("ignore", message="The default value of `n_init` will change from 3 to 'auto' in 1.4.")
 
 # Define a function to convert an RGB color to hex format
 def process_pixel(pixel):
@@ -25,6 +26,42 @@ def process_pixel(pixel):
         r, g, b = pixel
         return '%02x%02x%02x' % (r, g, b)
 
+
+def quantize_colors(image, num_colors):
+    # Convert the image from the RGB color space to the L*a*b* color space
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    
+    # Reshape the image into a feature vector
+    h, w = image.shape[:2]
+    image = image.reshape((h * w, 3))
+    
+    # Apply k-means using the specified number of clusters
+    clt = MiniBatchKMeans(n_clusters=num_colors)
+    labels = clt.fit_predict(image)
+    
+    # Create the quantized image based on the predictions
+    quantized = clt.cluster_centers_.astype("uint8")[labels]
+    
+    # Reshape the feature vectors to images
+    quantized = quantized.reshape((h, w, 3))
+    
+    # Convert from L*a*b* to RGB
+    quantized = cv2.cvtColor(quantized, cv2.COLOR_Lab2RGB)
+    
+    return quantized
+
+
+def retrieve_pixels(frame, gray_scale, HEIGHT, WIDTH):
+    resized_frame = cv2.resize(frame, (WIDTH, HEIGHT))
+    
+    if gray_scale:
+        gray_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2GRAY)
+        pixels = gray_frame.flatten().tolist()
+    else:
+        quantized_frame = quantize_colors(resized_frame, COLOR_ACCURACY)
+        pixels = [process_pixel(pixel) for pixel in quantized_frame.reshape(-1, 3)]
+    
+    return pixels
 
 # Define a route to get the pixel colors of a video
 @app.route('/get_pixels')
@@ -42,60 +79,31 @@ def get_pixels():
     print(WIDTH)
     print(HEIGHT)
 
-    fvs = imutils.video.FileVideoStream(video).start()
-
-    def retrieve_pixels(frame, frames):
-        resized_frame = cv2.resize(frame, (WIDTH, HEIGHT))            
-
-        pixels = []
-
-        if gray_scale:
-            gray_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2GRAY)
-
-            pixels = gray_frame.flatten().tolist()
-        else:
-            rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-
-            pixels = np.reshape(rgb_frame, (HEIGHT * WIDTH, 3))
-
-            hex_colors = np.apply_along_axis(process_pixel, 1, pixels)
-
-            pixels = hex_colors.tolist()
-
-        frames.append(pixels)
-
-    def read_frames(fvs, frame_queue):
-        while fvs.more():
-            frame = fvs.read()
-            frame_queue.put(frame)
-
-    frame_queue = queue.Queue()
-
-    t = threading.Thread(target=read_frames, args=(fvs, frame_queue))
-    t.daemon = True
-    t.start()
+    cap = cv2.VideoCapture(video)
 
     frames = []
 
-    while True:
-        frame = frame_queue.get()
+    with mp.Pool() as pool:
+        futures = []
 
-        if frame is None:
-            # print('stop')
-            break
+        while True:
+            ret, frame = cap.read()
 
-        t = threading.Thread(target=retrieve_pixels, args=(frame, frames))
-        t.daemon = True
-        t.start()
+            if not ret:
+                break
 
-        # print('next frame')
+            future = pool.apply_async(retrieve_pixels, args=(frame, gray_scale, HEIGHT, WIDTH))
+            futures.append(future)
 
-    t.join()
+            if len(futures) == BATCH_SIZE:
+                for future in futures:
+                    frames.append(future.get())
 
-    cv2.destroyAllWindows()
-    fvs.stop()
+                futures = []
 
     frames_data = json.dumps(frames)
+
+    cap.release()
 
     return Response(frames_data, mimetype='application/json')
 
